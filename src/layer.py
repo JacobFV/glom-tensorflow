@@ -26,15 +26,14 @@ import tensorflow as tf
 import tensorflow.keras as keras
 import tensorflow.keras.layers as tfkl
 
-from .ops import geometric_weighted_mean, get_lateral
+from .ops import inject_gradient, geometric_weighted_mean, get_lateral
 
 
 class GLOMLayer(tfkl.Layer):
-
     hparam_defaults = {
         'window_size': (7, 7),
         'global_sparsity': 0.05,
-        'normalize_beta': 0.9
+        'normalize_beta': 0.5,
     }
 
     forward_param_defaults = {
@@ -63,6 +62,7 @@ class GLOMLayer(tfkl.Layer):
             x_prev_below_shape, x_prev_shape, x_prev_above_shape,
             e_prev_below_shape, e_prev_shape, e_prev_above_shape,
             e_below_norm_prev_shape, e_norm_prev_shape, e_above_norm_prev_shape,
+            g_prev_below_shape, g_prev_above_shape,
             mu_e_prev_shape, sigma2_e_prev_shape
         ) = input_shape
 
@@ -75,64 +75,69 @@ class GLOMLayer(tfkl.Layer):
             x_prev_below, x_prev, x_prev_above,
             e_prev_below, e_prev, e_prev_above,
             e_below_norm_prev, e_norm_prev, e_above_norm_prev,
+            g_prev_below, g_prev_above,
             mu_e_prev, sigma2_e_prev
         ) = inputs
 
-        train_ops = []
-
         params: dict = self.forward_param_defaults.copy().update(kwargs)
+
+        if params['training']:
+            tape = tf.GradientTape()
+            tape.__enter__()
+            tape.watch([self.f_bu.trainable_variables,
+                        self.f_td.trainable_variables,
+                        x_prev_below, x_prev_above])
 
         if params['mode'] == 'awake':
 
-            x_lat = get_lateral(x=x_prev, window_size=self.hparams['window_size'],
-                                global_sparsity=self.hparams['global_sparsity'])
             x_bu = self.f_bu(x_prev_below)
             x_td = self.f_td(x_prev_above)
+            x_lat = get_lateral(x=x_prev, window_size=self.hparams['window_size'],
+                                global_sparsity=self.hparams['global_sparsity'])
+            x_lat = tf.stop_gradient(x_lat)
+
+            # TODO: use e_norm instead of e
             x = geometric_weighted_mean(
                 xs=[x_bu[..., None], x_td[..., None],
-                    tf.transpose(x_lat, perm=(0,1,2,4,3))],  # [B, X, Y, i, D] -> [B, X, Y, D, i]
-                ws=[e_prev_below[..., None],
-                    1. / (e_prev_above[..., None] + 1e-2),  # not sure if this will work
-                    tf.einsum('bxyid,bxyd->bxyi', x_lat, x_prev) / (self._depth ** 0.5)])
+                    tf.transpose(x_lat, perm=(0, 1, 2, 4, 3))],  # [B, X, Y, i, D] -> [B, X, Y, D, i]
+                ws=[e_below_norm_prev[..., None, None],  # [B, X, Y] -> [B, X, Y, D=1, i=1] (broadcast over D,i)
+                    1. / (e_above_norm_prev[..., None, None] + 1e-2),  # same as above. should approach equalibrium.
+                    tf.einsum('bxyid,bxyd->bxyi', x_lat, x_prev) / (self._depth ** 0.5)[..., None, :]
+                    ]) # lateral weights: [B, X, Y, i] -> [B, X, Y, D=1, i]
 
             new_e = x - x_prev
 
             with self.hparams['normalize_beta'] as beta:
-                mu_e = beta * mu_e_prev + (1-beta) * new_e
-                sigma2_e = beta * sigma2_e_prev + (1-beta) * (mu_e-new_e)**2
+                mu_e = beta * mu_e_prev + (1 - beta) * new_e
+                sigma2_e = beta * sigma2_e_prev + (1 - beta) * (mu_e - new_e) ** 2
 
-            e = (new_e - mu_e) / (sigma2_e ** 0.5)
-            e_norm = tf.norm(e, ord=1)
+            e = (new_e - mu_e)**2 / (sigma2_e ** 0.5)
+            e_norm = tf.norm(e, ord=1) / e.shape[-1]
 
-            if params['training'] == True:
+            if params['training']:
                 # train for similarity
+                tape.__exit__()
 
-                ######
-                # I need to manually backpropagate the errors
-                # or somehow otherwise retrieve the gradients of the very
-                # bottom layer to pass on to e_below
-                train_ops = [
-                    self._optimizer.minimize(
-                        keras.losses.mse(y_true=tf.stop_gradient(x_bu-e), y_pred=x_bu),
-                        var_list=self.f_bu.trainable_weights),
-                    # same thing for f_td
-                ]
+                (
+                    d_f_bu, d_f_td, g_td, g_bu
+                ) = tape.gradient(target=e,
+                                  sources=[self.f_bu.trainable_variables,
+                                           self.f_td.trainable_variables,
+                                           x_prev_below, x_prev_above],
+                                  output_gradients=g_prev_above+g_prev_below)
 
-        elif params['mode'] == 'asleep':
+                # assign grads_and_vars
+                grads_and_vars = [(d_f_bu, self.f_bu.trainable_variables),
+                                  (d_f_td, self.f_td.trainable_variables)]
+
+        else:  # params['mode'] == 'asleep'
             # no lateral. only top down (but how will the bottom up layers learn)?
 
-            if params['training'] == True:
+            if params['training']:
                 # train for difference
 
-                ######
-                # I need to manually backpropagate the errors
-                # or somehow otherwise retrieve the gradients of the very
-                # bottom layer to pass on to e_below
-                train_ops = [
-                    self._optimizer.minimize(
-                        keras.losses.mse(y_true=tf.stop_gradient(x_bu-e), y_pred=x_bu),
-                        var_list=self.f_bu.trainable_weights),
-                    # same thing for f_td
-                ]
+                grads_and_vars = []
 
-        return x, e, mu_e, sigma2_e, e_norm, train_ops
+            return
+
+        return x, e, e_norm, g_td, g_bu, mu_e, sigma2_e, grads_and_vars

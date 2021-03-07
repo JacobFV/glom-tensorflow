@@ -24,6 +24,9 @@ from typing import List
 
 import tensorflow as tf
 
+def inject_gradient(x, grad):
+    return tf.custom_gradient(lambda x: x, x+grad)
+
 def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tensor:
     """Computes the geometric weighted mean of values arranged
     along the final dimension of a list of `Tensor`s.
@@ -40,7 +43,8 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
             It can even be 1. However it must match the number of values in `ws`.
     :param ws: corresponding nonnegative weights for values (ws >= 0; sum ws[..., :] > 0)
             List[Tensor] [..., N_i] where N_i can be different across tensors
-            It can even be 1. However it must match the number of values in `xs`.
+            N_i even be 1. However it must match or be broadcastable across the
+            number of values in `xs`.
     :return: geometric weighted mean Tensor: [...]
     """
 
