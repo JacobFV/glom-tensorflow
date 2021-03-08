@@ -23,6 +23,8 @@
 
 from typing import Optional, Text
 
+import tensorflow as tf
+
 from ..utils.make_unique import make_name_unique
 
 
@@ -36,7 +38,15 @@ class MultiDirectionalLayer():
         assert isinstance(layer, MultiDirectionalLayer), 'must call with another `MultiDirectionalLayer` to build graph'
         self.below_layers = [layer]
 
-    def build(self, bu_var_shapes, self_var_shapes, td_var_shapes, **kwargs):
+    def build(self, bu_shape: tf.Tensor, self_shape: tf.Tensor, td_shape: tf.Tensor, **kwargs):
+        """Build internal layer weights with shape information. Shapes include batch dimension.
+
+        :param bu_shape: shape of lower layer
+        :param self_shape: shape of self layer
+        :param td_shape: shape of higher layer
+        :param kwargs:
+        :return:
+        """
         raise NotImplementedError('subclasses should impliment `build` method')
 
     def forward(self, bu_vars, self_vars, td_vars, **kwargs):

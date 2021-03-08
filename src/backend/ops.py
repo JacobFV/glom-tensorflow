@@ -21,7 +21,8 @@
 #  SOFTWARE.
 #
 
-from typing import List
+from typing import List, Tuple
+import warnings
 
 import tensorflow as tf
 
@@ -54,7 +55,7 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
                   tf.reduce_sum(ws, axis=-1))
 
 
-def get_lateral(x, window_size, global_sparsity) -> tf.Tensor:
+def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], global_sparsity: float) -> tf.Tensor:
     """gets local and global lateral elements in a grid
 
     :param x: Tensor: [B, X, Y, D]
@@ -81,6 +82,14 @@ def get_lateral(x, window_size, global_sparsity) -> tf.Tensor:
     x_local = tf.stack(shifted_list, axis=3)  # [B, X, Y, i, D]
 
     # global elements
-    x_global = TODO
+    clipped_global_sparsity = tf.clip_by_value(global_sparsity, 0 + 1e-3, 1 - 1e-3)
+    if clipped_global_sparsity != global_sparsity:
+        warnings.warn(f'global sparsity level {global_sparsity} was clipped to {clipped_global_sparsity} .')
+
+    N_g = 1. / (1. - global_sparsity)
+    B, X, Y, D = x.shape.as_list()
+    x_global = tf.reshape(x, (B, X*Y/N_g, N_g, D))   # [B, X*Y/N_g, N_g, D]
+    x_global = tf.tile(x_global, tf.constant([1, N_g, 1, 1]))  # [B, X*Y, N_g, D]
+    x_global = tf.reshape(x_global, (B, X, Y, N_g, D))  # [B, X, Y, N_g, D]
 
     return tf.concat([x_local, x_global], axis=3)

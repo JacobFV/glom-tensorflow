@@ -69,10 +69,12 @@ class GLOMLayer(MultiDirectionalLayer):
 
         self._optimizer = keras.optimizers.Adam(1e-3)
 
-    def build(self, bu_var_shapes, self_var_shapes, td_var_shapes, **kwargs):
+    def build(self, bu_shape: tf.Tensor, self_shape: tf.Tensor, td_shape: tf.Tensor, **kwargs):
         # x_prev_shape: [B, X, Y, D]
-        self._size = x_prev_shape[1:3]
-        self._depth = x_prev_shape[3]
+        assert bu_shape == self_shape and self_shape == td_shape, 'GLOMLayer shapes do not match.'
+
+        self._size = self_shape[1:3]
+        self._depth = self_shape[3]
 
     def forward(self, bu_vars, self_vars, td_vars, **kwargs):
 
@@ -89,6 +91,7 @@ class GLOMLayer(MultiDirectionalLayer):
         g_td_prev = bu_vars['g_td_prev']
         e_above_norm_prev = bu_vars['e_above_norm_prev']
 
+        # TODO: I need to use these variables apporpriately
         td_ret_vars = dict()
         self_ret_vars = dict()
         bu_ret_vars = dict()
