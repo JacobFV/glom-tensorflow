@@ -55,11 +55,15 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
                   tf.reduce_sum(ws, axis=-1))
 
 
-def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], global_sparsity: float) -> tf.Tensor:
+def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: bool = False, global_sparsity: float) -> tf.Tensor:
     """gets local and global lateral elements in a grid
 
     :param x: Tensor: [B, X, Y, D]
     :param window_size: tuple: [h, w]
+    :param roll_over: bool. Whether edges on opposite ends are conneted.
+            As a 1-dimensional example [-1] recieves [-3,-2,-1,0,1] as its window.
+            If false, the local convolution operation is padded with zeros
+            instead of spilling over.
     :param global_sparsity: percentage (0.-1.) of global slices to take
     :return: per-location receptive field: [B, X, Y, i, D]
     """
@@ -67,11 +71,17 @@ def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], global_sparsity: flo
     # local elements
 
     # pad x
-    x_local_padded = tf.pad(x, paddings=tf.constant([[0, 0],
-                                                     [window_size[0] // 2, window_size[0] // 2],
-                                                     [window_size[1] // 2, window_size[1] // 2],
-                                                     [0, 0]]))
-    # [B, X+h-1, Y+w-1, D]
+    if not roll_over:
+        h = window_size[0]
+        w = window_size[1]
+        x_local_padded = tf.pad(x, paddings=tf.constant([[0, 0],
+                                                         [h // 2, h // 2],
+                                                         [w // 2, w // 2],
+                                                         [0, 0]]))
+        # [B, X+h-1, Y+w-1, D]
+    else:
+        pass
+        x_local_padded = x # [B, X, Y, D]
 
     shifted_list = list()
     for ofset1 in tf.range(window_size[0]):
@@ -79,7 +89,15 @@ def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], global_sparsity: flo
         for ofset2 in tf.range(window_size[1]):
             shifted_list.append(tf.roll(x_shifted_tmp, shift=ofset2, axis=2))
 
-    x_local = tf.stack(shifted_list, axis=3)  # [B, X, Y, i, D]
+    x_local = tf.stack(shifted_list, axis=3)
+    # [B, X+h-1, Y+w-1, h*w, D] or [B, X, Y, D]
+
+    if not roll_over:
+        h = window_size[0]
+        w = window_size[1]
+        x_local = x_local[:,h//2:-h//2, w//2:-w//2, :] # [B, X, Y, D]
+    else:
+        pass # x_local already [B, X, Y, D]
 
     # global elements
     clipped_global_sparsity = tf.clip_by_value(global_sparsity, 0 + 1e-3, 1 - 1e-3)

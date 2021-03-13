@@ -32,15 +32,19 @@ class PeripheralLayer(MultiDirectionalLayer):
     """Interal layer type for inputs and outputs."""
 
     def __init__(self,
-                 shape: Tuple[int, int],
+                 shape: Tuple[int, int, int],
                  allow_control: Optional[bool] = True,
                  controllable_mask: Optional[tf.Tensor] = None):
+        """
 
-        self.shape = shape
+        :param shape: (height, width, depth) shape
+        :param allow_control: specify `allow_control` to create a uniform 0 or 1 `controllable_mask`
+        :param controllable_mask: mask to apply to top_down biases before changing outputs.
+        """
+
+        super(PeripheralLayer, self).__init__(shape=shape)
 
         if controllable_mask is None:
             controllable_mask = tf.cast(allow_control, backend.config.get_dtype())
 
         self.controllable_mask = controllable_mask
-
-        super(PeripheralLayer, self).__init__()

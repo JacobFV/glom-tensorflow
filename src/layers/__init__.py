@@ -24,4 +24,4 @@
 from .multidirectional_layer import MultiDirectionalLayer
 from .peripheral_layer import PeripheralLayer
 from .glom_layer import GLOMLayer
-from .concat_layer import ConcatLayer
+from .routing_layer import RoutingLayer

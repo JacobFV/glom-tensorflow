@@ -32,13 +32,13 @@
 # furnished to do so, subject to the following conditions:
 #
 #
-from typing import Text, Mapping, Optional
+from typing import Text, Mapping, Optional, Tuple, List, Union
 
 import tensorflow as tf
 import tensorflow.keras as keras
 
+from ..backend.ops import geometric_weighted_mean, get_lateral
 from .multidirectional_layer import MultiDirectionalLayer
-from ..backend import geometric_weighted_mean, get_lateral
 
 
 class GLOMLayer(MultiDirectionalLayer):
@@ -64,32 +64,169 @@ class GLOMLayer(MultiDirectionalLayer):
         self.f_bu = f_bu
         self.f_td = f_td
 
-        if hparams is None: hparams = dict()
+        if hparams is None:
+            hparams = dict()
         self.hparams = GLOMLayer.hparam_defaults.copy().update(hparams)
 
-        self._optimizer = keras.optimizers.Adam(1e-3)
+    def build(self, bu_shapes: List[tf.TensorShape], **kwargs):
+        assert len(bu_shapes) == 1, 'GLOMLayer can only accept one incoming layer'
+        self.shape = bu_shapes[0][0:2]
 
-    def build(self, bu_shape: tf.Tensor, self_shape: tf.Tensor, td_shape: tf.Tensor, **kwargs):
-        # x_prev_shape: [B, X, Y, D]
-        assert bu_shape == self_shape and self_shape == td_shape, 'GLOMLayer shapes do not match.'
+    def get_initial_state_shape(self, **kwargs) -> Mapping[Text, tf.TensorShape]:
+        """Build internal layer weights with shape information. Shapes do not include batch dimension.
 
-        self._size = self_shape[1:3]
-        self._depth = self_shape[3]
+        :param kwargs: dictionary containing:
+            * 'mode': 'awake' or 'asleep'
+            * 'training': True or False
+        :return: dictionary of `TensorShape`'s.
+        """
+        mode = kwargs['mode']
+        training = kwargs['training']
+        initial_state_shape = dict()
 
-    def forward(self, bu_vars, self_vars, td_vars, **kwargs):
+        if mode == 'awake' and training:
+            initial_state_shape = dict(
+                x=self.shape,
+                sigma2_g=self.shape[0:1],
+                # TODO
+            )
+        elif mode == 'awake' and not training:
+            return dict()
+        elif mode == 'asleep' and training:
+            return dict()
+        elif mode == 'asleep' and not training:
+            return dict()
+        else:
+            raise AttributeError('`mode` not \'awake\' or \'asleep\'')
+        return initial_state_shape
+
+    def forward(self,
+                prev_bu_vars: List[Mapping[Text, object]],
+                prev_self_vars: Mapping[Text, object],
+                prev_td_vars: List[Mapping[Text, object]],
+                **kwargs) \
+            -> Tuple[List[Mapping[Text, object]],
+                     Mapping[Text, object],
+                     List[Mapping[Text, object]],
+                     List[Tuple[tf.Tensor, tf.Variable]]]:
+        """Forward pass for multidirectional layer. Called by `GLOMRNNCell`.
+
+        :param prev_bu_vars: bottom up vars output by layer(s) below at previous timestep
+        :param prev_self_vars: vars output by self at previous timestep
+        :param prev_td_vars: top down vars output by layer(s) above at previous timestep
+        :param kwargs:
+        :return: (next_bu_vars, next_self_vars, next_td_vars, grads_and_vars) tuple.
+            `next_bu_vars` are supplied to the layer(s) above and `next_td_vars` are
+            supplied to the layer(s) below. `grads_and_vars` are processed by the optimizer
+            and may be an empty list.
+        """
+        params: dict = self.forward_param_defaults.copy().update(kwargs)
+        call_fns = {
+            ('awake', True): self._forward_awake_training,
+            ('awake', False): self._forward_awake_not_training,
+            ('asleep', True): self._forward_asleep_training,
+            ('asleep', False): self._forward_asleep_not_training,
+        }
+        call_fn = call_fns[(params['mode'], params['training'])]
+        return call_fn(prev_bu_vars, prev_self_vars, prev_td_vars)
+
+    def _forward_awake_training(self,
+                                prev_bu_vars: List[Mapping[Text, object]],
+                                prev_self_vars: Mapping[Text, object],
+                                prev_td_vars: List[Mapping[Text, object]],
+                                **kwargs) \
+            -> Tuple[List[Mapping[Text, object]],
+                     Mapping[Text, object],
+                     List[Mapping[Text, object]],
+                     List[Tuple[tf.Tensor, tf.Variable]]]:
+        """Forward pass for multidirectional layer. Called by `GLOMRNNCell`.
+
+        :param prev_bu_vars: bottom up vars output by layer(s) below at previous timestep
+        :param prev_self_vars: vars output by self at previous timestep
+        :param prev_td_vars: top down vars output by layer(s) above at previous timestep
+        :param kwargs:
+        :return: (next_bu_vars, next_self_vars, next_td_vars, grads_and_vars) tuple.
+            `next_bu_vars` are supplied to the layer(s) above and `next_td_vars` are
+            supplied to the layer(s) below. `grads_and_vars` are processed by the optimizer
+            and may be an empty list.
+        """
+
+    def _forward_awake_not_training(self,
+                                    prev_bu_vars: List[Mapping[Text, object]],
+                                    prev_self_vars: Mapping[Text, object],
+                                    prev_td_vars: List[Mapping[Text, object]],
+                                    **kwargs) \
+            -> Tuple[List[Mapping[Text, object]],
+                     Mapping[Text, object],
+                     List[Mapping[Text, object]],
+                     List[Tuple[tf.Tensor, tf.Variable]]]:
+        """Forward pass for multidirectional layer. Called by `GLOMRNNCell`.
+
+        :param prev_bu_vars: bottom up vars output by layer(s) below at previous timestep
+        :param prev_self_vars: vars output by self at previous timestep
+        :param prev_td_vars: top down vars output by layer(s) above at previous timestep
+        :param kwargs:
+        :return: (next_bu_vars, next_self_vars, next_td_vars, grads_and_vars) tuple.
+            `next_bu_vars` are supplied to the layer(s) above and `next_td_vars` are
+            supplied to the layer(s) below. `grads_and_vars` are processed by the optimizer
+            and may be an empty list.
+        """
+
+    def _forward_asleep_training(self,
+                                 prev_bu_vars: List[Mapping[Text, object]],
+                                 prev_self_vars: Mapping[Text, object],
+                                 prev_td_vars: List[Mapping[Text, object]],
+                                 **kwargs) \
+            -> Tuple[List[Mapping[Text, object]],
+                     Mapping[Text, object],
+                     List[Mapping[Text, object]],
+                     List[Tuple[tf.Tensor, tf.Variable]]]:
+        """Forward pass for multidirectional layer. Called by `GLOMRNNCell`.
+
+        :param prev_bu_vars: bottom up vars output by layer(s) below at previous timestep
+        :param prev_self_vars: vars output by self at previous timestep
+        :param prev_td_vars: top down vars output by layer(s) above at previous timestep
+        :param kwargs:
+        :return: (next_bu_vars, next_self_vars, next_td_vars, grads_and_vars) tuple.
+            `next_bu_vars` are supplied to the layer(s) above and `next_td_vars` are
+            supplied to the layer(s) below. `grads_and_vars` are processed by the optimizer
+            and may be an empty list.
+        """
+
+    def _forward_asleep_not_training(self,
+                                     prev_bu_vars: List[Mapping[Text, object]],
+                                     prev_self_vars: Mapping[Text, object],
+                                     prev_td_vars: List[Mapping[Text, object]],
+                                     **kwargs) \
+            -> Tuple[List[Mapping[Text, object]],
+                     Mapping[Text, object],
+                     List[Mapping[Text, object]],
+                     List[Tuple[tf.Tensor, tf.Variable]]]:
+        """Forward pass for multidirectional layer. Called by `GLOMRNNCell`.
+
+        :param prev_bu_vars: bottom up vars output by layer(s) below at previous timestep
+        :param prev_self_vars: vars output by self at previous timestep
+        :param prev_td_vars: top down vars output by layer(s) above at previous timestep
+        :param kwargs:
+        :return: (next_bu_vars, next_self_vars, next_td_vars) tuple.
+            NOTE: `next_bu_vars` are supplied to the layer(s) above and `next_td_vars` are
+            supplied to the layer(s) below.
+        """
+
+        ###def forward(self, bu_vars, self_vars, td_vars, **kwargs):
 
         params: dict = self.forward_param_defaults.copy().update(kwargs)
 
-        x_below_prev = bu_vars['x_below_prev']
-        g_bu_prev = bu_vars['g_bu_prev']
-        e_below_norm_prev = bu_vars['e_below_norm_prev']
+        x_below_prev = bu_vars['x']
+        g_bu_prev = bu_vars['g_bu']
+        e_below_norm_prev = bu_vars['e_norm']
 
-        x_prev = self_vars['x_prev']
-        sigma2_g_prev = self_vars['sigma2_g_prev']
+        x_prev = self_vars['x']
+        sigma2_g_prev = self_vars['sigma2_g']
 
-        x_above_prev = bu_vars['x_above_prev']
-        g_td_prev = bu_vars['g_td_prev']
-        e_above_norm_prev = bu_vars['e_above_norm_prev']
+        x_above_prev = bu_vars['x']
+        g_td_prev = bu_vars['g_td']
+        e_above_norm_prev = bu_vars['e_norm']
 
         # TODO: I need to use these variables apporpriately
         td_ret_vars = dict()
@@ -167,7 +304,7 @@ class GLOMLayer(MultiDirectionalLayer):
 
                 with self.hparams['normalize_beta'] as beta:
                     # I do not want continually shifting representations
-                    mu_g = 0 # mu_e = beta * mu_e_prev + (1 - beta) * new_e
+                    mu_g = 0  # mu_e = beta * mu_e_prev + (1 - beta) * new_e
                     sigma2_g = beta * sigma2_g_prev + (1 - beta) * (mu_g - new_g) ** 2
 
                 g = new_g / (sigma2_g ** 0.5)
