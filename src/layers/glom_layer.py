@@ -49,7 +49,7 @@ class GLOMLayer(MultiDirectionalLayer):
     }
 
     forward_param_defaults = {
-        'mode': 'awake',  # 'awake'|'asleep'
+        '_mode': 'awake',  # 'awake'|'asleep'
         'training': False
     }
 
@@ -76,11 +76,11 @@ class GLOMLayer(MultiDirectionalLayer):
         """Build internal layer weights with shape information. Shapes do not include batch dimension.
 
         :param kwargs: dictionary containing:
-            * 'mode': 'awake' or 'asleep'
+            * '_mode': 'awake' or 'asleep'
             * 'training': True or False
         :return: dictionary of `TensorShape`'s.
         """
-        mode = kwargs['mode']
+        mode = kwargs['_mode']
         training = kwargs['training']
         initial_state_shape = dict()
 
@@ -97,7 +97,7 @@ class GLOMLayer(MultiDirectionalLayer):
         elif mode == 'asleep' and not training:
             return dict()
         else:
-            raise AttributeError('`mode` not \'awake\' or \'asleep\'')
+            raise AttributeError('`_mode` not \'awake\' or \'asleep\'')
         return initial_state_shape
 
     def forward(self,
@@ -127,7 +127,7 @@ class GLOMLayer(MultiDirectionalLayer):
             ('asleep', True): self._forward_asleep_training,
             ('asleep', False): self._forward_asleep_not_training,
         }
-        call_fn = call_fns[(params['mode'], params['training'])]
+        call_fn = call_fns[(params['_mode'], params['training'])]
         return call_fn(prev_bu_vars, prev_self_vars, prev_td_vars)
 
     def _forward_awake_training(self,
@@ -234,7 +234,7 @@ class GLOMLayer(MultiDirectionalLayer):
         bu_ret_vars = dict()
         grads_and_vars = list()
 
-        if params['mode'] == 'awake':
+        if params['_mode'] == 'awake':
 
             ###################### DAYTIME - TRAINING ######################
             if params['training']:
@@ -312,7 +312,7 @@ class GLOMLayer(MultiDirectionalLayer):
                 # e = (new_e - mu_e)**2 / (sigma2_e ** 0.5)
                 g_norm = tf.norm(g, ord=1, axis=-1) / (g.shape[-1] ** 0.5)
 
-        else:  # params['mode'] == 'asleep'
+        else:  # params['_mode'] == 'asleep'
             # no lateral. only top down (but how will the bottom up layers learn)?
 
             ###################### NIGHTTIME - TRAINING ######################
