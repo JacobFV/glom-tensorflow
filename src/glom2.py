@@ -168,8 +168,10 @@ class GLOMCell(tfkl.AbstractRNNCell):
                 input_grads, weight_grads = tape.gradient(
                     target=outputs,
                     sources=(input_xs, connection['fn'].trainable_weights),
-                    output_gradients=[layer_states[layer]['e'] + layer_states[layer]['e_td']
-                                      for layer in connection['outputs']])
+                    output_gradients=[(output - layer_states[layer]['x'])  # positive-stage contrastive objective
+                                      + layer_states[layer]['e_td']  # backpropagate top down errors
+                                      for layer, output
+                                      in zip(connection['outputs'], outputs)])
                 # store parameter gradients
                 grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])                # backpropagate e_bu
                 # backpropagate errors top down
@@ -197,10 +199,12 @@ class GLOMCell(tfkl.AbstractRNNCell):
                 input_grads, weight_grads = tape.gradient(
                     target=outputs,
                     sources=(input_xs, connection['fn'].trainable_weights),
-                    output_gradients=[layer_states[layer]['e'] + layer_states[layer]['e_bu']
-                                      for layer in connection['outputs']])
+                    output_gradients=[(output - layer_states[layer]['x'])  # positive-stage contrastive objective
+                                      + layer_states[layer]['e_bu']  # backpropagate bottom up errors
+                                      for layer, output
+                                      in zip(connection['outputs'], outputs)])
                 # store parameter gradients
-                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])                # backpropagate e_bu
+                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])
                 # backpropagate errors bottom up
                 for layer in connection['outputs']:
                     new_layer_states[layer]['e_bu'] = input_grads
