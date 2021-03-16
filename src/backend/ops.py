@@ -56,64 +56,6 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
                   tf.reduce_sum(ws, axis=-1))
 
 
-def get_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: bool = False, global_sparsity: float) -> tf.Tensor:
-    """gets local and global lateral elements in a grid
-
-    :param x: Tensor: [B, X, Y, D]
-    :param window_size: tuple: [h, w]
-    :param roll_over: bool. Whether edges on opposite ends are conneted.
-            As a 1-dimensional example [-1] recieves [-3,-2,-1,0,1] as its window.
-            If false, the local convolution operation is padded with zeros
-            instead of spilling over.
-    :param global_sparsity: percentage (0.-1.) of global slices to take
-    :return: concatented per-location local and global receptive field: [B, X, Y, i, D]
-    """
-
-    # local elements
-
-    # pad x
-    if not roll_over:
-        h = window_size[0]
-        w = window_size[1]
-        x_local_padded = tf.pad(x, paddings=tf.constant([[0, 0],
-                                                         [h // 2, h // 2],
-                                                         [w // 2, w // 2],
-                                                         [0, 0]]))
-        # [B, X+h-1, Y+w-1, D]
-    else:
-        pass
-        x_local_padded = x # [B, X, Y, D]
-
-    shifted_list = list()
-    for ofset1 in tf.range(window_size[0]):
-        x_shifted_tmp = tf.roll(x_local_padded, shift=ofset1, axis=1)
-        for ofset2 in tf.range(window_size[1]):
-            shifted_list.append(tf.roll(x_shifted_tmp, shift=ofset2, axis=2))
-
-    x_local = tf.stack(shifted_list, axis=3)
-    # [B, X+h-1, Y+w-1, h*w, D] or [B, X, Y, D]
-
-    if not roll_over:
-        h = window_size[0]
-        w = window_size[1]
-        x_local = x_local[:,h//2:-h//2, w//2:-w//2, :] # [B, X, Y, D]
-    else:
-        pass # x_local already [B, X, Y, D]
-
-    # global elements
-    clipped_global_sparsity = tf.clip_by_value(global_sparsity, 0 + 1e-3, 1 - 1e-3)
-    if clipped_global_sparsity != global_sparsity:
-        warnings.warn(f'global sparsity level {global_sparsity} was clipped to {clipped_global_sparsity} .')
-
-    N_g = 1. / (1. - global_sparsity)
-    B, X, Y, D = x.shape.as_list()
-    x_global = tf.reshape(x, (B, X*Y/N_g, N_g, D))   # [B, X*Y/N_g, N_g, D]
-    x_global = tf.tile(x_global, tf.constant([1, N_g, 1, 1]))  # [B, X*Y, N_g, D]
-    x_global = tf.reshape(x_global, (B, X, Y, N_g, D))  # [B, X, Y, N_g, D]
-
-    return tf.concat([x_local, x_global], axis=3)
-
-
 def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: bool = False) -> tf.Tensor:
     """gets local and global lateral elements in a grid
 

@@ -28,6 +28,7 @@ import tensorflow as tf
 import tensorflow.keras as keras
 import tensorflow.keras.layers as tfkl
 
+from .utils import is_tensor_type
 from .backend.ops import geometric_weighted_mean, get_local_lateral, get_global_lateral
 
 # anything that can directly initialize tf.zeros(.) is acceptable
@@ -37,13 +38,19 @@ Shape3D = Union[Tuple[int, int, int], tf.TensorShape, tf.Tensor]
 class GLOMCell(tfkl.AbstractRNNCell):
 
     HPARAM_DEFAULTS = dict(
-        w_td        = 0.,
-        w_lat       = 0.,
-        w_bu        = 0.,
-        sparsity    = 0.2,
-        lr_awake    = 0.005,
-        lr_asleep   = 0.02,
-        epsilon_control = 1e-3,
+        a_td                = 0.,       # top down weight multiply
+        a_lat               = 0.,       # lateral weight multiply
+        a_bu                = 0.,       # bottom up weight multiply
+        b_td                = 0.,       # top down weight shift
+        b_lat               = 0.,       # lateral weight shift
+        b_bu                = 0.,       # bottom up weight shift
+        sparsity            = 0.2,      # activation sparsity
+        lr_awake            = 0.005,    # learning rate when awake
+        lr_asleep           = 0.02,     # learning rate when asleep
+        epsilon_control     = 1e-3,     # prevents ln(0) for td attn weight
+        window_size         = (5, 5),   # x_loc window
+        roll_over           = True,     # x_loc connect edges
+        global_sparsity     = 0.1,      # x_global sparsity
     )
 
     CONN_KS = dict(
@@ -150,6 +157,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
                 # since they are `Tensors` and not-necesarily trainale
                 tape.watch(input_xs)
                 outputs = connection['fn'](input_xs)
+                ssl_loss = sum(connection['fn'].losses)
                 outputs = tf.nest.flatten(outputs)  # ensure is list. x -> [x]
 
             # get weights to multiply by
@@ -165,15 +173,21 @@ class GLOMCell(tfkl.AbstractRNNCell):
                 ws = tf.nest.map_structure(bu_err2w, bu_errs)
 
                 # compute e_td and nn grads
+                # combine self-supervised loss with positive-stage contrastive objective
+                td_loss = ssl_loss + sum([ (output - layer_states[layer]['x'])
+                    for layer, output in zip(connection['outputs'], outputs)])
+                # this subtraction op is reused later. but I will let grappler recognize
+                # the congruency if it is truly important
+
+                ##### TODO: I need to include ssl_loss in the gradient calculation
+
                 input_grads, weight_grads = tape.gradient(
-                    target=outputs,
+                    target=td_loss,  # positive-stage contrastive objective,
                     sources=(input_xs, connection['fn'].trainable_weights),
-                    output_gradients=[(output - layer_states[layer]['x'])  # positive-stage contrastive objective
-                                      + layer_states[layer]['e_td']  # backpropagate top down errors
-                                      for layer, output
-                                      in zip(connection['outputs'], outputs)])
+                    output_gradients=[layer_states[layer]['e_td']  # backpropagate top down errors
+                                      for layer in connection['outputs']])
                 # store parameter gradients
-                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])                # backpropagate e_bu
+                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])
                 # backpropagate errors top down
                 for layer in connection['outputs']:
                     new_layer_states[layer]['e_td'] = input_grads
@@ -223,7 +237,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
         # update errors
         for layer, state in new_layer_states.keys():
             new_layer_states[layer]['e'] = new_layer_states[layer]['x'] - layer_states[layer]['x']
-            new_layer_states[layer]['e_norm'] = tf.norm(new_layer_states[layer]['e'], ord=1, axis=-1)
+            new_layer_states[layer]['e_norm'] = tf.reduce_sum(new_layer_states[layer]['e']**2, axis=-1)
 
         return new_layer_states, None
 
@@ -267,15 +281,34 @@ class GLOMLayer(tfkl.Layer):
     def map_inputs(self, inputs):
         raise NotImplementedError('subclasses should implement this method')
 
-"""class LateralAgglomerate(tfkl.Layer):
-    
+class LateralAgglomerate(GLOMLayer):
+
+    def __init__(self, hparams: Mapping, name: Optional[Text] = None):
+        super(LateralAgglomerate, self).__init__(trainable=False, name=name)
+        self.hparams = hparams
+
     def build(self, input_shape):
         self.agglomerate_layer = None
     
     def call(self, inputs, **kwargs):
-        tf.assert_rank(inputs, 4, 'inputs should be four dimensional [B, X, Y, D]')
-        """
+        x = tf.nest.flatten(inputs)[0]
+        tf.assert_rank(x, 4, 'inputs should be four dimensional [B, X, Y, D]')
 
+        x_loc = get_local_lateral(x=x,
+                                  window_size=self.hparams['window_size'],
+                                  roll_over=self.hparams['roll_over'])
+        x_global = get_global_lateral(x=x, global_sparsity=self.hparams['global_sparsity'])
+
+        sim_local = tf.einsum('...d,...id', x, x_loc)
+        sim_global = tf.einsum('...d,...id', x, x_global)
+        sim_cat = tf.concat([sim_local, sim_global], axis=-2)
+        self.add_loss(tf.reduce_mean(sim_global) - tf.reduce_mean(sim_local))
+
+        return sim_cat, x
+
+
+    def map_inputs(self, inputs):
+        raise NotImplementedError('lateral layers should not call `map_inputs`')
 
 class ConcatTransformSplit(GLOMLayer):
 
@@ -363,7 +396,3 @@ class DenseND(GLOMLayer):
         if is_tensor_type(inputs[0]) and self._input_shape == self._output_shape:
             return inputs[0]  # standard glom AE layers
         return self.call(inputs)  # this is probably not what I want
-
-
-def is_tensor_type(t):
-    return hasattr(t, 'shape')
