@@ -36,28 +36,27 @@ Shape3D = Union[Tuple[int, int, int], tf.TensorShape, tf.Tensor]
 
 
 class GLOMCell(tfkl.AbstractRNNCell):
-
     HPARAM_DEFAULTS = dict(
-        a_td                = 0.,       # top down weight multiply
-        a_lat               = 0.,       # lateral weight multiply
-        a_bu                = 0.,       # bottom up weight multiply
-        b_td                = 0.,       # top down weight shift
-        b_lat               = 0.,       # lateral weight shift
-        b_bu                = 0.,       # bottom up weight shift
-        sparsity            = 0.2,      # activation sparsity
-        lr_awake            = 0.005,    # learning rate when awake
-        lr_asleep           = 0.02,     # learning rate when asleep
-        epsilon_control     = 1e-3,     # prevents ln(0) for td attn weight
-        window_size         = (5, 5),   # x_loc window
-        roll_over           = True,     # x_loc connect edges
-        global_sparsity     = 0.1,      # x_global sparsity
+        a_td=0.,  # top down weight multiply
+        a_lat=0.,  # lateral weight multiply
+        a_bu=0.,  # bottom up weight multiply
+        b_td=0.,  # top down weight shift
+        b_lat=0.,  # lateral weight shift
+        b_bu=0.,  # bottom up weight shift
+        sparsity=0.2,  # activation sparsity
+        lr_awake=0.005,  # learning rate when awake
+        lr_asleep=0.02,  # learning rate when asleep
+        epsilon_control=1e-3,  # prevents ln(0) for td attn weight
+        window_size=(5, 5),  # x_loc window
+        roll_over=True,  # x_loc connect edges
+        global_sparsity=0.1,  # x_global sparsity
     )
 
     CONN_KS = dict(
-        fn = 'fn',  # if None (default) a neural network is made and stored by GLOMCell
-        inputs = 'inputs',  # list, tuple, or single string
-        outputs = 'outputs',  # list, tuple, or single string
-        type = 'type',  # 'bu' | 'td' | 'lat'
+        fn='fn',  # if None (default) a neural network is made and stored by GLOMCell
+        inputs='inputs',  # list, tuple, or single string
+        outputs='outputs',  # list, tuple, or single string
+        type='type',  # 'bu' | 'td' | 'lat'
     )
 
     def __init__(self,
@@ -98,7 +97,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
             if 'fn' not in connections[i]:
                 connections[i]['fn'] = None
 
-            #for output in self.connections[i]['outputs']:
+            # for output in self.connections[i]['outputs']:
             #    self.layer_params[output]['nun_inputs'] += 1
 
         self.call_fns = {
@@ -112,8 +111,8 @@ class GLOMCell(tfkl.AbstractRNNCell):
         for i, connection in enumerate(self.connections):
             if connection['fn'] is None:
                 self.connections[i]['fn'] = DenseND(
-                    input_shape=self.layer_sizes[connection['bu_inputs']],
-                    output_shape=self.layer_sizes[connection['td_inputs']],
+                    input_shape=self.layer_sizes[connection['inputs'][0]],
+                    output_shape=self.layer_sizes[connection['outputs'][0]],
                     sparsity=self.hparams['sparsity'])
 
     def call(self, inputs: Tuple[dict, dict], training=None, mask=None):
@@ -139,95 +138,75 @@ class GLOMCell(tfkl.AbstractRNNCell):
                tf.nest.flatten(new_layer_states)
 
     def _call_awake_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
+            -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
 
-        new_layer_states = dict()
+        new_errs = {layer: list() for layer in self.layer_sizes.keys()}
         layer_targets = {layer: list() for layer in self.layer_sizes.keys()}
+        new_layer_states = dict()
         grads_and_vars = []
 
         # compute targets for all layers and backpropagate errors
         for connection in self.connections:
             # get inputs
-            input_xs = [layer_states[layer]['x']
-                        for layer in connection['inputs']]
+            input_vals = [layer_states[layer]['x'] for layer in connection['inputs']]
 
-            # run function
+            # forward propagation
             with tf.GradientTape() as tape:
                 # I think I have to explicitly watch input_xs
                 # since they are `Tensors` and not-necesarily trainale
-                tape.watch(input_xs)
-                outputs = connection['fn'](input_xs)
+                tape.watch(input_vals)
+                output_vals = connection['fn'](input_vals)
                 ssl_loss = sum(connection['fn'].losses)
-                outputs = tf.nest.flatten(outputs)  # ensure is list. x -> [x]
 
-            # get weights to multiply by
-            conn_type = connection['type']
-            if conn_type == 'bu':
-                # compute GWM weight
-                input_errs = [layer_states[layer]['e_bu'] for layer in connection['inputs']]
-                bu_errs = connection['fn'].map_inputs(input_errs)
-                # contrast attention field salience
-                def bu_err2w(bu_err):
-                    w = self.hparams['a_bu'] * bu_err + self.hparams['b_bu']
-                    return w
-                ws = tf.nest.map_structure(bu_err2w, bu_errs)
+            output_vals = tf.nest.flatten(output_vals)  # ensure is list. x -> [x]
 
-                # compute e_td and nn grads
-                # combine self-supervised loss with positive-stage contrastive objective
-                td_loss = ssl_loss + sum([ (output - layer_states[layer]['x'])
-                    for layer, output in zip(connection['outputs'], outputs)])
-                # this subtraction op is reused later. but I will let grappler recognize
-                # the congruency if it is truly important
+            # difference-based saliency
+            ws = [(val - layer_states[layer]['x']) ** 2
+                  for layer, val in zip(connection['outputs'], output_vals)]
 
-                ##### TODO: I need to include ssl_loss in the gradient calculation
+            # apply hyper-parameters
+            conn_type = connection['type']  # 'bu' or 'td'. Must match dictionary key exactly
+            ws = [self.hparams[f'a_{conn_type}'] * w + self.hparams[f'b_{conn_type}'] for w in ws]
 
-                input_grads, weight_grads = tape.gradient(
-                    target=td_loss,  # positive-stage contrastive objective,
-                    sources=(input_xs, connection['fn'].trainable_weights),
-                    output_gradients=[layer_states[layer]['e_td']  # backpropagate top down errors
-                                      for layer in connection['outputs']])
-                # store parameter gradients
-                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])
-                # backpropagate errors top down
-                for layer in connection['outputs']:
-                    new_layer_states[layer]['e_td'] = input_grads
-
-            elif conn_type == 'lat':
-                sim, outputs = outputs
-                # similarity based neighbor influence
-                w = self.hparams['a_lat'] * sim + self.hparams['b_lat']
-                ws = [w]
-                # no gradients to update!
-
-            elif conn_type == 'td':
-                input_errs = [layer_states[layer]['e_td'] for layer in connection['inputs']]
-                td_errs = connection['fn'].map_inputs(input_errs)
-                # similarity-based control
-                def td_err2w(td_err):
-                    control = -tf.math.log(td_err + self.hparams['epsilon_control'])
-                    w = self.hpoutputsarams['a_td'] * control + self.hparams['b_td']
-                    return w
-                ws = tf.nest.map_structure(td_err2w, td_errs)
-
-                # compute e_bu and nn grads
-                input_grads, weight_grads = tape.gradient(
-                    target=outputs,
-                    sources=(input_xs, connection['fn'].trainable_weights),
-                    output_gradients=[(output - layer_states[layer]['x'])  # positive-stage contrastive objective
-                                      + layer_states[layer]['e_bu']  # backpropagate bottom up errors
-                                      for layer, output
-                                      in zip(connection['outputs'], outputs)])
-                # store parameter gradients
-                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])
-                # backpropagate errors bottom up
-                for layer in connection['outputs']:
-                    new_layer_states[layer]['e_bu'] = input_grads
-
-            # clean outputs. converts x to [x]
-            outputs = tf.nest.flatten(outputs)
-            # assign outputs
-            for layer, w, output in zip(connection['outputs'], ws, outputs):
+            # assign output vals
+            for layer, w, output in zip(connection['outputs'], ws, output_vals):
                 layer_targets[layer].append((w, output))
+
+            # backpropagate errors
+            input_grads, weight_grads = tape.gradient(
+                target=output_vals,
+                sources=(input_vals, connection['fn'].trainable_weights),
+                output_gradients=[layer_states[layer]['e'] for layer in connection['outputs']])
+
+            #### TODO: include ssl_loss in the gradient calculation
+
+            # backpropagate errors top down
+            for layer, input_grad in zip(connection['inputs'], input_grads):
+                new_errs[layer].append(input_grad)
+
+            # store parameter gradients
+            grads_and_vars.extend([(grads, var) for grads, var
+                                   in zip(weight_grads, connection['fn'].trainable_weights)])
+
+        # compute lateral self-attention
+        for layer in layer_states.keys():
+            x = layer_states[layer]['x']
+            tf.assert_rank(x, 4, 'inputs should be four dimensional [B, X, Y, D]')
+
+            x_local = get_local_lateral(x=x, window_size=self.hparams['window_size'],
+                                        roll_over=self.hparams['roll_over'])
+            x_global = get_global_lateral(x=x, global_sparsity=self.hparams['global_sparsity'])
+            x_neighbor = tf.concat([x_local, x_global], axis=-2)
+
+            # compute similarity scores; assuming values are normal, divide by sqrt(num depth dimensions)
+            similarity = tf.einsum('...d,...id->...i', x, x_neighbor) / (similarity.shape[-1]**0.5)
+            layer_targets[layer].append((similarity, x))
+
+            # NOTE There are no trainable parameters so this spatial contrastive objective does nothing!
+            # sim_local = tf.einsum('...d,...id', x, x_local)
+            # sim_global = tf.einsum('...d,...id', x, x_global)
+            # sim_cat = tf.concat([sim_local, sim_global], axis=-2)
+            # self.add_loss(tf.reduce_mean(sim_global) - tf.reduce_mean(sim_local))
 
         # apply targets
         for layer, targets in layer_targets.items():
@@ -236,21 +215,22 @@ class GLOMCell(tfkl.AbstractRNNCell):
 
         # update errors
         for layer, state in new_layer_states.keys():
-            new_layer_states[layer]['e'] = new_layer_states[layer]['x'] - layer_states[layer]['x']
-            new_layer_states[layer]['e_norm'] = tf.reduce_sum(new_layer_states[layer]['e']**2, axis=-1)
+            new_errs[layer].append(new_layer_states[layer]['x'] - layer_states[layer]['x'])
+            new_layer_states[layer]['e'] = sum(new_errs[layer]) / len(new_errs[layer])
+            new_layer_states[layer]['e_norm'] = tf.reduce_sum(new_layer_states[layer]['e'] ** 2, axis=-1)
 
         return new_layer_states, None
 
     def _call_awake_not_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
+            -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     def _call_asleep_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
+            -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     def _call_asleep_not_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
+            -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     @property
@@ -258,8 +238,6 @@ class GLOMCell(tfkl.AbstractRNNCell):
         initial_state_sizes = {layer: {
             'x': size,
             'e': size,
-            'e_bu': size,
-            'e_td': size,
             'e_norm': size[:-1],
         } for layer, size in self.layer_sizes.items()}
         return tf.nest.flatten(initial_state_sizes)
@@ -276,41 +254,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
         self._mode = mode
 
 
-class GLOMLayer(tfkl.Layer):
-
-    def map_inputs(self, inputs):
-        raise NotImplementedError('subclasses should implement this method')
-
-class LateralAgglomerate(GLOMLayer):
-
-    def __init__(self, hparams: Mapping, name: Optional[Text] = None):
-        super(LateralAgglomerate, self).__init__(trainable=False, name=name)
-        self.hparams = hparams
-
-    def build(self, input_shape):
-        self.agglomerate_layer = None
-    
-    def call(self, inputs, **kwargs):
-        x = tf.nest.flatten(inputs)[0]
-        tf.assert_rank(x, 4, 'inputs should be four dimensional [B, X, Y, D]')
-
-        x_loc = get_local_lateral(x=x,
-                                  window_size=self.hparams['window_size'],
-                                  roll_over=self.hparams['roll_over'])
-        x_global = get_global_lateral(x=x, global_sparsity=self.hparams['global_sparsity'])
-
-        sim_local = tf.einsum('...d,...id', x, x_loc)
-        sim_global = tf.einsum('...d,...id', x, x_global)
-        sim_cat = tf.concat([sim_local, sim_global], axis=-2)
-        self.add_loss(tf.reduce_mean(sim_global) - tf.reduce_mean(sim_local))
-
-        return sim_cat, x
-
-
-    def map_inputs(self, inputs):
-        raise NotImplementedError('lateral layers should not call `map_inputs`')
-
-class ConcatTransformSplit(GLOMLayer):
+class ConcatTransformSplit(tfkl.Layer):
 
     def __init__(self,
                  transform_fn: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
@@ -336,8 +280,8 @@ class ConcatTransformSplit(GLOMLayer):
     def build(self, input_shape):
         if self.do_split:
             self.split_layer = tfkl.Lambda(lambda x: tf.split(x,
-                 num_or_size_splits=self.num_or_size_splits,
-                 axis=self.split_axis))
+                                                              num_or_size_splits=self.num_or_size_splits,
+                                                              axis=self.split_axis))
 
     def call(self, inputs, **kwargs):
         inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
@@ -352,7 +296,7 @@ class ConcatTransformSplit(GLOMLayer):
         return self.call(inputs)
 
 
-class DenseND(GLOMLayer):
+class DenseND(tfkl.Layer):
 
     def __init__(self, input_shape, output_shape, sparsity=0.1, activation='relu', name=None):
         super(DenseND, self).__init__(name=name)
@@ -368,17 +312,16 @@ class DenseND(GLOMLayer):
         d2 = (self._input_shape[-1] + self._output_shape[-1]) / 2
         d3 = self.output_shape[-1]
 
-        self.W1 = self.add_weight(name=self.name+'_W1', shape=locs+(d1, d2))
-        self.b1 = self.add_weight(name=self.name+'_b1', shape=locs+(d2,))
-        self.W2 = self.add_weight(name=self.name+'_W2', shape=locs+(d2, d3))
-        self.b2 = self.add_weight(name=self.name+'_b2', shape=locs+(d3,))
+        self.W1 = self.add_weight(name=self.name + '_W1', shape=locs + (d1, d2))
+        self.b1 = self.add_weight(name=self.name + '_b1', shape=locs + (d2,))
+        self.W2 = self.add_weight(name=self.name + '_W2', shape=locs + (d2, d3))
+        self.b2 = self.add_weight(name=self.name + '_b2', shape=locs + (d3,))
 
         if isinstance(self.activation, str):
             self.activation = tfkl.Activation(self.activation)
         assert isinstance(self.activation, Callable), 'activation must be callable or valid keras activation'
 
     def call(self, inputs, training=None, mask=None):
-
         inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
         x1 = inputs[0]
 
@@ -386,13 +329,7 @@ class DenseND(GLOMLayer):
         x3 = self.activation(tf.einsum('...a,...ab->...b', x2, self.W2) + self.b2)
 
         # some recent arxiv paper suggested this over x**2 penality. Not sure if it works
-        self.add_loss(tf.reduce_sum(tf.exp(x3)/tf.reduce_sum(x3, axis=-1)))
-        self.add_loss((tf.reduce_mean(x3) - self.sparsity)**2)
+        self.add_loss(tf.reduce_sum(tf.exp(x3) / tf.reduce_sum(x3, axis=-1)))
+        self.add_loss((tf.reduce_mean(x3) - self.sparsity) ** 2)
 
         return x3
-
-    def map_inputs(self, inputs):
-        inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
-        if is_tensor_type(inputs[0]) and self._input_shape == self._output_shape:
-            return inputs[0]  # standard glom AE layers
-        return self.call(inputs)  # this is probably not what I want
