@@ -53,9 +53,6 @@ class GLOMCell(tfkl.AbstractRNNCell):
         type = 'type',  # 'bu' | 'td' | 'lat'
     )
 
-    # The recurrent state is initialized with these keys. All values share dimensions.
-    _layer_state_ks = ['x', 'g_bu', 'g_td', 'e']  # does not include targets
-
     def __init__(self,
                  input_layers: List[Text],
                  output_layers: List[Text],
@@ -135,42 +132,83 @@ class GLOMCell(tfkl.AbstractRNNCell):
                tf.nest.flatten(new_layer_states)
 
     def _call_awake_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], Tuple[tf.Tensor, tf.Variable]]:
+        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
 
         new_layer_states = dict()
         layer_targets = {layer: list() for layer in self.layer_sizes.keys()}
+        grads_and_vars = []
 
-        # compute targets for all layers
+        # compute targets for all layers and backpropagate errors
         for connection in self.connections:
             # get inputs
-            input_vars = [layer_states[layer]['x']
-                          for layer in connection['inputs']]
+            input_xs = [layer_states[layer]['x']
+                        for layer in connection['inputs']]
 
             # run function
-            outputs = connection['fn'](input_vars)
+            with tf.GradientTape() as tape:
+                # I think I have to explicitly watch input_xs
+                # since they are `Tensors` and not-necesarily trainale
+                tape.watch(input_xs)
+                outputs = connection['fn'](input_xs)
+                outputs = tf.nest.flatten(outputs)  # ensure is list. x -> [x]
 
             # get weights to multiply by
             conn_type = connection['type']
             if conn_type == 'bu':
+                # compute GWM weight
                 input_errs = [layer_states[layer]['e_bu'] for layer in connection['inputs']]
-                mean_err = sum(input_errs) / len(input_errs)
+                bu_errs = connection['fn'].map_inputs(input_errs)
                 # contrast attention field salience
-                w = self.hparams['a_bu'] * mean_err + self.hparams['b_bu']
+                def bu_err2w(bu_err):
+                    w = self.hparams['a_bu'] * bu_err + self.hparams['b_bu']
+                    return w
+                ws = tf.nest.map_structure(bu_err2w, bu_errs)
+
+                # compute e_td and nn grads
+                input_grads, weight_grads = tape.gradient(
+                    target=outputs,
+                    sources=(input_xs, connection['fn'].trainable_weights),
+                    output_gradients=[layer_states[layer]['e'] + layer_states[layer]['e_td']
+                                      for layer in connection['outputs']])
+                # store parameter gradients
+                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])                # backpropagate e_bu
+                # backpropagate errors top down
+                for layer in connection['outputs']:
+                    new_layer_states[layer]['e_td'] = input_grads
+
             elif conn_type == 'lat':
                 sim, outputs = outputs
                 # similarity based neighbor influence
                 w = self.hparams['a_lat'] * sim + self.hparams['b_lat']
+                ws = [w]
+                # no gradients to update!
+
             elif conn_type == 'td':
                 input_errs = [layer_states[layer]['e_td'] for layer in connection['inputs']]
-                mean_err = sum(input_errs) / len(input_errs)
-                control = -tf.math.log(mean_err + self.hparams['epsilon_control'])
+                td_errs = connection['fn'].map_inputs(input_errs)
                 # similarity-based control
-                w = self.hparams['a_td'] * control + self.hparams['b_td']
+                def td_err2w(td_err):
+                    control = -tf.math.log(td_err + self.hparams['epsilon_control'])
+                    w = self.hpoutputsarams['a_td'] * control + self.hparams['b_td']
+                    return w
+                ws = tf.nest.map_structure(td_err2w, td_errs)
+
+                # compute e_bu and nn grads
+                input_grads, weight_grads = tape.gradient(
+                    target=outputs,
+                    sources=(input_xs, connection['fn'].trainable_weights),
+                    output_gradients=[layer_states[layer]['e'] + layer_states[layer]['e_bu']
+                                      for layer in connection['outputs']])
+                # store parameter gradients
+                grads_and_vars.extend([(g, w) for g, w in zip(weight_grads, connection['fn'].trainable_weights)])                # backpropagate e_bu
+                # backpropagate errors bottom up
+                for layer in connection['outputs']:
+                    new_layer_states[layer]['e_bu'] = input_grads
 
             # clean outputs. converts x to [x]
             outputs = tf.nest.flatten(outputs)
             # assign outputs
-            for layer, output in zip(connection['outputs'], outputs):
+            for layer, w, output in zip(connection['outputs'], ws, outputs):
                 layer_targets[layer].append((w, output))
 
         # apply targets
@@ -178,26 +216,34 @@ class GLOMCell(tfkl.AbstractRNNCell):
             new_layer_states[layer]['x'] = geometric_weighted_mean(
                 xs=[x for x, w in targets], ws=[w for x, w in targets])
 
-        # backprop error down gradients depending on whether fn is 'td' or 'bu'
+        # update errors
+        for layer, state in new_layer_states.keys():
+            new_layer_states[layer]['e'] = new_layer_states[layer]['x'] - layer_states[layer]['x']
+            new_layer_states[layer]['e_norm'] = tf.norm(new_layer_states[layer]['e'], ord=1, axis=-1)
 
         return new_layer_states, None
 
     def _call_awake_not_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], Tuple[tf.Tensor, tf.Variable]]:
+        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     def _call_asleep_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], Tuple[tf.Tensor, tf.Variable]]:
+        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     def _call_asleep_not_training(self, layer_states: Mapping[Text, Mapping[Text, tf.Tensor]]) \
-        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], Tuple[tf.Tensor, tf.Variable]]:
+        -> Tuple[Mapping[Text, Mapping[Text, tf.Tensor]], List[Tuple[tf.Tensor, tf.Variable]]]:
         pass
 
     @property
     def state_size(self):
-        initial_state_sizes = {layer: {k: size for k in GLOMCell._layer_state_ks}
-                                     for layer, size in self.layer_sizes.items()}
+        initial_state_sizes = {layer: {
+            'x': size,
+            'e': size,
+            'e_bu': size,
+            'e_td': size,
+            'e_norm': size[:-1],
+        } for layer, size in self.layer_sizes.items()}
         return tf.nest.flatten(initial_state_sizes)
 
     @property
@@ -212,6 +258,11 @@ class GLOMCell(tfkl.AbstractRNNCell):
         self._mode = mode
 
 
+class GLOMLayer(tfkl.Layer):
+
+    def map_inputs(self, inputs):
+        raise NotImplementedError('subclasses should implement this method')
+
 """class LateralAgglomerate(tfkl.Layer):
     
     def build(self, input_shape):
@@ -222,12 +273,12 @@ class GLOMCell(tfkl.AbstractRNNCell):
         """
 
 
-class ConcatTransformSplit(tfkl.Layer):
+class ConcatTransformSplit(GLOMLayer):
 
     def __init__(self,
-                 split_sizes: List[int],
                  transform_fn: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
                  concat_axis: Optional[int] = -2,
+                 num_or_size_splits: Optional[List[int]] = None,
                  split_axis: Optional[int] = -2,
                  name: Optional[Text] = None):
         super(ConcatTransformSplit, self).__init__(name=name)
@@ -235,23 +286,36 @@ class ConcatTransformSplit(tfkl.Layer):
         if transform_fn is None:
             transform_fn = (lambda x: x)
 
-        self.split_sizes = split_sizes
         self.transform_fn = transform_fn
         self.concat_axis = concat_axis
+        self.num_or_size_splits = num_or_size_splits
         self.split_axis = split_axis
 
+        if self.split_sizes is None:
+            self.do_split = False
+        else:
+            self.do_split = True
+
     def build(self, input_shape):
-        self.split_layer = tfkl.Lambda(lambda x:
-            tf.split(x, self.split_sizes, axis=self.split_axis))
+        if self.do_split:
+            self.split_layer = tfkl.Lambda(lambda x: tf.split(x,
+                 num_or_size_splits=self.num_or_size_splits,
+                 axis=self.split_axis))
 
     def call(self, inputs, **kwargs):
+        inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
         x_cat = tfkl.concatenate(inputs, axis=self.concat_axis)
         x_transformed = self.transform_fn(x_cat)
-        x_splits = self.split_layer(x_transformed)
-        return x_splits
+        if self.do_split:
+            return self.split_layer(x_transformed)
+        else:
+            return x_transformed
+
+    def map_inputs(self, inputs):
+        return self.call(inputs)
 
 
-class DenseND(keras.Model):
+class DenseND(GLOMLayer):
 
     def __init__(self, input_shape, output_shape, sparsity=0.1, activation='relu', name=None):
         super(DenseND, self).__init__(name=name)
@@ -278,7 +342,9 @@ class DenseND(keras.Model):
 
     def call(self, inputs, training=None, mask=None):
 
-        x1 = inputs
+        inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
+        x1 = inputs[0]
+
         x2 = self.activation(tf.einsum('...a,...ab->...b', x1, self.W1) + self.b1)
         x3 = self.activation(tf.einsum('...a,...ab->...b', x2, self.W2) + self.b2)
 
@@ -287,3 +353,13 @@ class DenseND(keras.Model):
         self.add_loss((tf.reduce_mean(x3) - self.sparsity)**2)
 
         return x3
+
+    def map_inputs(self, inputs):
+        inputs = tf.nest.flatten(inputs)  # ensure inputs is a `list`
+        if is_tensor_type(inputs[0]) and self._input_shape == self._output_shape:
+            return inputs[0]  # standard glom AE layers
+        return self.call(inputs)  # this is probably not what I want
+
+
+def is_tensor_type(t):
+    return hasattr(t, 'shape')

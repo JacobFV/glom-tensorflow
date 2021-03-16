@@ -48,6 +48,7 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
     :return: tuple (geometric weighted mean Tensor: [...], normalized weights [...])
     """
 
+    raise NotImplementedError('this should work for broadcastable different sized operands')
     xs = tf.concat(xs, axis=-1)
     ws = tf.concat(ws, axis=-1)
 
