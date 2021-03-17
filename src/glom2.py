@@ -50,6 +50,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
         window_size=(5, 5),  # x_loc window
         roll_over=True,  # x_loc connect edges
         global_sparsity=0.1,  # x_global sparsity
+        connection_activation='relu',  # for interlayer influence
     )
 
     CONN_KS = dict(
@@ -110,14 +111,21 @@ class GLOMCell(tfkl.AbstractRNNCell):
     def build(self, input_shape):
         for i, connection in enumerate(self.connections):
             if connection['fn'] is None:
-                self.connections[i]['fn'] = DenseND(
-                    input_shape=self.layer_sizes[connection['inputs'][0]],
-                    output_shape=self.layer_sizes[connection['outputs'][0]],
-                    sparsity=self.hparams['sparsity'])
+                self.connections[i]['fn'] = ManyToManyDense(
+                    input_layer_shapes=[(layer, self.layer_sizes[layer])
+                                        for layer in connection['inputs']],
+                    output_layer_shapes=[(layer, self.layer_sizes[layer])
+                                         for layer in connection['outputs']],
+                    activation=self.hparams['connection_activation'],
+                    sparsity=self.hparams['sparsity'],
+                    concat_axis=-2, split_axis=-2,
+                    name=f'<{", ".join(connection["inputs"])}> - <{", ".join(connection["outputs"])}>'
+                )
 
     def call(self, inputs: Tuple[dict, dict], training=None, mask=None):
         observations, layer_states_flat = inputs
-        if training is None: training = False
+        if training is None:
+            training = False
         layer_states = tf.nest.pack_sequence_as(self.layer_sizes, layer_states_flat)
 
         # randomize order to simulate true asychronous updating
@@ -152,13 +160,18 @@ class GLOMCell(tfkl.AbstractRNNCell):
 
             # forward propagation
             with tf.GradientTape() as tape:
-                # I think I have to explicitly watch input_xs
-                # since they are `Tensors` and not-necesarily trainale
                 tape.watch(input_vals)
                 output_vals = connection['fn'](input_vals)
                 ssl_loss = sum(connection['fn'].losses)
 
             output_vals = tf.nest.flatten(output_vals)  # ensure is list. x -> [x]
+
+            # TODO If I want contrastive spatial representation, add this to the gradients targets
+            # get x_local, x_global from output_val for each output_val in output_vals
+            # sim_local = tf.einsum('...d,...id', x, x_local)
+            # sim_global = tf.einsum('...d,...id', x, x_global)
+            # sim_cat = tf.concat([sim_local, sim_global], axis=-2)
+            # self.add_loss(tf.reduce_mean(sim_global) - tf.reduce_mean(sim_local))
 
             # difference-based saliency
             ws = [(val - layer_states[layer]['x']) ** 2
@@ -174,11 +187,9 @@ class GLOMCell(tfkl.AbstractRNNCell):
 
             # backpropagate errors
             input_grads, weight_grads = tape.gradient(
-                target=output_vals,
+                target=(output_vals, ssl_loss),
                 sources=(input_vals, connection['fn'].trainable_weights),
                 output_gradients=[layer_states[layer]['e'] for layer in connection['outputs']])
-
-            #### TODO: include ssl_loss in the gradient calculation
 
             # backpropagate errors top down
             for layer, input_grad in zip(connection['inputs'], input_grads):
@@ -201,12 +212,6 @@ class GLOMCell(tfkl.AbstractRNNCell):
             # compute similarity scores; assuming values are normal, divide by sqrt(num depth dimensions)
             similarity = tf.einsum('...d,...id->...i', x, x_neighbor) / (similarity.shape[-1]**0.5)
             layer_targets[layer].append((similarity, x))
-
-            # NOTE There are no trainable parameters so this spatial contrastive objective does nothing!
-            # sim_local = tf.einsum('...d,...id', x, x_local)
-            # sim_global = tf.einsum('...d,...id', x, x_global)
-            # sim_cat = tf.concat([sim_local, sim_global], axis=-2)
-            # self.add_loss(tf.reduce_mean(sim_global) - tf.reduce_mean(sim_local))
 
         # apply targets
         for layer, targets in layer_targets.items():
@@ -253,8 +258,60 @@ class GLOMCell(tfkl.AbstractRNNCell):
     def set_mode(self, mode):
         self._mode = mode
 
+class ManyToManyDense(tfkl.Layer):
 
-class ConcatTransformSplit(tfkl.Layer):
+    def __init__(self,
+                 input_layer_shapes: List[Tuple[Text, Shape3D]],
+                 output_layer_shapes: List[Tuple[Text, Shape3D]],
+                 activation: Union[Text, Callable] = 'relu',
+                 sparsity: float = 0.1,
+                 concat_axis: int = -2,
+                 split_axis: int = -2,
+                 name: Text = None):
+        super(ManyToManyDense, self).__init__(name=name)
+
+        self.input_layer_shapes = input_layer_shapes
+        self.output_layer_shapes = output_layer_shapes
+        self.activation = activation
+        self.sparsity = sparsity
+        self.concat_axis = concat_axis
+        self.split_axis = split_axis
+
+    def build(self, input_shape):
+        del input_shape
+
+        combined_input_len = sum(input_layer_shape[1][self.concat_axis]
+                                 for input_layer_shape in self.input_layer_shapes)
+        input_shape = self.input_layer_shapes[0][1]
+        input_shape[self.concat_axis] = combined_input_len
+
+        combined_output_len = sum(output_layer_shape[1][self.split_axis]
+                                  for output_layer_shape in self.output_layer_shapes)
+        output_shape = self.output_layer_shapes[0][1]
+        output_shape[self.split_axis] = combined_output_len
+
+        self.denseND_layer = _DenseND(
+            input_shape=input_shape,
+            output_shape=output_shape,
+            sparsity=self.sparsity,
+            activation=self.activation,
+            name=f'{self.name}_denseND'
+        )
+
+        self.concat_transform_split = _ConcatTransformSplit(
+            transform_fn=self.denseND_layer,
+            concat_axis=self.concat_axis,
+            num_or_size_splits=[output_layer_shape[1][self.split_axis]
+                                for output_layer_shape in self.output_layer_shapes],
+            split_axis=self.split_axis,
+            name=f'{self.name}_concatsplit'
+        )
+
+    def call(self, inputs, **kwargs):
+        return self.concat_transform_split(inputs)
+
+
+class _ConcatTransformSplit(tfkl.Layer):
 
     def __init__(self,
                  transform_fn: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
@@ -262,7 +319,7 @@ class ConcatTransformSplit(tfkl.Layer):
                  num_or_size_splits: Optional[List[int]] = None,
                  split_axis: Optional[int] = -2,
                  name: Optional[Text] = None):
-        super(ConcatTransformSplit, self).__init__(name=name)
+        super(_ConcatTransformSplit, self).__init__(name=name)
 
         if transform_fn is None:
             transform_fn = (lambda x: x)
@@ -296,10 +353,10 @@ class ConcatTransformSplit(tfkl.Layer):
         return self.call(inputs)
 
 
-class DenseND(tfkl.Layer):
+class _DenseND(tfkl.Layer):
 
     def __init__(self, input_shape, output_shape, sparsity=0.1, activation='relu', name=None):
-        super(DenseND, self).__init__(name=name)
+        super(_DenseND, self).__init__(name=name)
         self._input_shape = input_shape
         self._output_shape = output_shape
         self.sparsity = sparsity
