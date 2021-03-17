@@ -21,4 +21,4 @@
 # SOFTWARE.
 
 from . import layers
-from .glom import GlOMModel
+# from .glom import GlOMModel

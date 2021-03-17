@@ -37,9 +37,9 @@ Shape3D = Union[Tuple[int, int, int], tf.TensorShape, tf.Tensor]
 
 class GLOMCell(tfkl.AbstractRNNCell):
     HPARAM_DEFAULTS = dict(
-        a_td=0.,  # top down weight multiply
-        a_lat=0.,  # lateral weight multiply
-        a_bu=0.,  # bottom up weight multiply
+        a_td=1.,  # top down weight multiply
+        a_lat=1.,  # lateral weight multiply
+        a_bu=1.,  # bottom up weight multiply
         b_td=0.,  # top down weight shift
         b_lat=0.,  # lateral weight shift
         b_bu=0.,  # bottom up weight shift
@@ -78,7 +78,10 @@ class GLOMCell(tfkl.AbstractRNNCell):
         self.output_layers = output_layers
         self.layer_sizes = layer_sizes
         self.connections = connections
-        self.hparams: dict = GLOMCell.HPARAM_DEFAULTS.copy().update(hparams)
+        if hparams is None:
+            hparams = dict()
+        self.hparams: dict = GLOMCell.HPARAM_DEFAULTS.copy()
+        self.hparams.update(hparams)
 
         if awake_optimizer is None:
             awake_optimizer = tf.optimizers.SGD(self.hparams['lr_awake'])
@@ -122,8 +125,11 @@ class GLOMCell(tfkl.AbstractRNNCell):
                     name=f'<{", ".join(connection["inputs"])}> - <{", ".join(connection["outputs"])}>'
                 )
 
-    def call(self, inputs: Tuple[dict, dict], training=None, mask=None):
-        observations, layer_states_flat = inputs
+    def call(self, inputs, states, training=None):
+    ###def call(self, inputs: Tuple[dict, dict], training=None):
+        ##observations, layer_states_flat = inputs
+        observations, layer_states_flat = inputs, states
+        training = True  # QT workaround "call() got multiple values for argument 'training'"
         if training is None:
             training = False
         layer_states = tf.nest.pack_sequence_as(self.layer_sizes, layer_states_flat)
@@ -183,7 +189,7 @@ class GLOMCell(tfkl.AbstractRNNCell):
 
             # assign output vals
             for layer, w, output in zip(connection['outputs'], ws, output_vals):
-                layer_targets[layer].append((w, output))
+                layer_targets[layer].append((w, output[..., tf.newaxis]))
 
             # backpropagate errors
             input_grads, weight_grads = tape.gradient(
@@ -208,10 +214,12 @@ class GLOMCell(tfkl.AbstractRNNCell):
                                         roll_over=self.hparams['roll_over'])
             x_global = get_global_lateral(x=x, global_sparsity=self.hparams['global_sparsity'])
             x_neighbor = tf.concat([x_local, x_global], axis=-2)
+            x_neighbor = tf.einsum('...id->...di', x_neighbor)
 
             # compute similarity scores; assuming values are normal, divide by sqrt(num depth dimensions)
-            similarity = tf.einsum('...d,...id->...i', x, x_neighbor) / (similarity.shape[-1]**0.5)
-            layer_targets[layer].append((similarity, x))
+            similarity = tf.einsum('...d,...di->...i', x, x_neighbor) / (similarity.shape[-1]**0.5)
+            similarity = self.hparams['a_lat'] * similarity + self.hparams['b_lat']
+            layer_targets[layer].append((similarity, x_neighbor))
 
         # apply targets
         for layer, targets in layer_targets.items():

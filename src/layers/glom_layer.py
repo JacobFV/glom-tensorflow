@@ -37,7 +37,7 @@ from typing import Text, Mapping, Optional, Tuple, List, Union
 import tensorflow as tf
 import tensorflow.keras as keras
 
-from ..backend.ops import geometric_weighted_mean, get_lateral
+from ..backend.ops import geometric_weighted_mean, get_local_lateral, get_global_lateral
 from .multidirectional_layer import MultiDirectionalLayer
 
 

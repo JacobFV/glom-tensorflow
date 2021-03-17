@@ -27,9 +27,11 @@ import warnings
 import tensorflow as tf
 
 
-def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tensor:
+def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor], mean_axis=-1) -> tf.Tensor:
     """Computes the geometric weighted mean of values arranged along the final
     dimension of a list of `Tensor`s. Computes normalized weights in the process.
+
+    NOTE: weights must have exact matching dimensions (Except along the mean_axis)
 
     Uses logorithms to speed up computations:
     GWM(x,w) = (ProdSum x^w)^(1/Sum w)
@@ -45,19 +47,20 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tens
             List[Tensor] [..., N_i] where N_i can be different across tensors
             N_i even be 1. However it must match or be broadcastable across the
             number of values in `xs`.
+    :param mean_axis: In all the shape annotations above, the geometric weighted mean
+            is computed on axis=-1. However, that can be configured by `mean_axis`.
     :return: tuple (geometric weighted mean Tensor: [...], normalized weights [...])
     """
 
-    raise NotImplementedError('this should work for broadcastable different sized operands')
-    xs = tf.concat(xs, axis=-1)
-    ws = tf.concat(ws, axis=-1)
+    xs = tf.concat(xs, axis=-mean_axis)
+    ws = tf.concat(ws, axis=-mean_axis)
 
-    return tf.exp(tf.reduce_sum(ws * tf.math.log(xs), axis=-1) /
-                  tf.reduce_sum(ws, axis=-1))
+    return tf.exp(tf.reduce_sum(ws * tf.math.log(xs), axis=-mean_axis) /
+                  tf.reduce_sum(ws, axis=-mean_axis))
 
 
 def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: bool = False) -> tf.Tensor:
-    """gets local and global lateral elements in a grid
+    """gets local lateral elements in a grid
 
     :param x: Tensor: [B, X, Y, D]
     :param window_size: tuple: [h, w]
@@ -67,8 +70,6 @@ def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: boo
             instead of spilling over.
     :return: per-location local receptive field: [B, X, Y, i, D]
     """
-
-    # local elements
 
     # pad x
     if not roll_over:
@@ -103,14 +104,13 @@ def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: boo
 
 
 def get_global_lateral(x: tf.Tensor, global_sparsity: float) -> tf.Tensor:
-    """gets local and global lateral elements in a grid
+    """gets global lateral elements over a grid
 
     :param x: Tensor: [B, X, Y, D]
     :param global_sparsity: percentage (0.-1.) of global slices to take
     :return: per-location global receptive field: [B, X, Y, i, D]
     """
 
-    # global elements
     clipped_global_sparsity = tf.clip_by_value(global_sparsity, 0 + 1e-3, 1 - 1e-3)
     if clipped_global_sparsity != global_sparsity:
         warnings.warn(f'global sparsity level {global_sparsity} was clipped to {clipped_global_sparsity} .')

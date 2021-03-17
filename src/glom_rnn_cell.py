@@ -35,6 +35,7 @@ class GLOMRNNCell(tfkl.AbstractRNNCell):
 
         ## recursively climb the layer graph and call build on layers whose children
         ## all have specified shapes
+        pass
 
     def call(self, inputs, states):
         # rename all dict keys from '...' to '...(_above|_below|)_prev'
@@ -49,3 +50,4 @@ class GLOMRNNCell(tfkl.AbstractRNNCell):
         pass
 
     def _rename_keys_layerwise(self, ) -> Mapping[Text, Mapping[Text, object]]:
+        pass

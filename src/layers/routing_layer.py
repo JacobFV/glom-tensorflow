@@ -143,5 +143,6 @@ class RoutingLayerComponent(MultiDirectionalLayer):
         for k, td_var in td_vars.items():
             # only split the var if it matches self.lower_split_indeces[-1] on self.lower_concat_axis
             if td_var.shape[self.lower_concat_axis] == self.lower_split_indeces[-1]:
-
+                raise NotImplementedError('I will probably abandon this')
             else:
+                raise NotImplementedError('I will probably abandon this')
