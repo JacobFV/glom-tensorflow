@@ -20,5 +20,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from . import layers
-# from .glom import GlOMModel
+# from .glom import GLOM

@@ -27,7 +27,7 @@ import warnings
 import tensorflow as tf
 
 
-def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor], mean_axis=-1) -> tf.Tensor:
+def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor]) -> tf.Tensor:
     """Computes the geometric weighted mean of values arranged along the final
     dimension of a list of `Tensor`s. Computes normalized weights in the process.
 
@@ -47,16 +47,18 @@ def geometric_weighted_mean(xs: List[tf.Tensor], ws: List[tf.Tensor], mean_axis=
             List[Tensor] [..., N_i] where N_i can be different across tensors
             N_i even be 1. However it must match or be broadcastable across the
             number of values in `xs`.
-    :param mean_axis: In all the shape annotations above, the geometric weighted mean
-            is computed on axis=-1. However, that can be configured by `mean_axis`.
     :return: tuple (geometric weighted mean Tensor: [...], normalized weights [...])
     """
 
-    xs = tf.concat(xs, axis=-mean_axis)
-    ws = tf.concat(ws, axis=-mean_axis)
+    xs = tf.concat(xs, axis=-1)
+    ws = tf.concat(ws, axis=-1)
+    ws = ws[..., None, :]
+    xs = tf.nn.relu(xs)
 
-    return tf.exp(tf.reduce_sum(ws * tf.math.log(xs), axis=-mean_axis) /
-                  tf.reduce_sum(ws, axis=-mean_axis))
+    y = tf.exp(tf.reduce_sum(ws * tf.math.log(xs + 1e-3), axis=-1) /
+                  (tf.reduce_sum(ws, axis=-1) + 1e-3))
+
+    return y
 
 
 def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: bool = False) -> tf.Tensor:
@@ -65,11 +67,13 @@ def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: boo
     :param x: Tensor: [B, X, Y, D]
     :param window_size: tuple: [h, w]
     :param roll_over: bool. Whether edges on opposite ends are conneted.
-            As a 1-dimensional example [-1] recieves [-3,-2,-1,0,1] as its window.
-            If false, the local convolution operation is padded with zeros
-            instead of spilling over.
+            If `False`, the local convolution operation is padded with
+            zeros instead of spilling over. If `True`, the leftmost elements
+            of one axis recieve the rightmost elements in their receptive field.
     :return: per-location local receptive field: [B, X, Y, i, D]
     """
+
+    # return x[..., None, :]  # TODO just want to debug tf graph
 
     # pad x
     if not roll_over:
@@ -82,13 +86,13 @@ def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: boo
         # [B, X+h-1, Y+w-1, D]
     else:
         pass
-        x_local_padded = x # [B, X, Y, D]
+        x_local_padded = x  # [B, X, Y, D]
 
     shifted_list = list()
     for ofset1 in tf.range(window_size[0]):
-        x_shifted_tmp = tf.roll(x_local_padded, shift=ofset1, axis=1)
+        x_shifted_tmp = tf.roll(x_local_padded, shift=ofset1, axis=1, name='rollA')
         for ofset2 in tf.range(window_size[1]):
-            shifted_list.append(tf.roll(x_shifted_tmp, shift=ofset2, axis=2))
+            shifted_list.append(tf.roll(x_shifted_tmp, shift=ofset2, axis=2, name='rollB'))
 
     x_local = tf.stack(shifted_list, axis=3)
     # [B, X+h-1, Y+w-1, h*w, D] or [B, X, Y, D]
@@ -96,7 +100,7 @@ def get_local_lateral(x: tf.Tensor, window_size: Tuple[int, int], roll_over: boo
     if not roll_over:
         h = window_size[0]
         w = window_size[1]
-        x_local = x_local[:,h//2:-h//2, w//2:-w//2, :] # [B, X, Y, D]
+        x_local = x_local[:, h//2:-h//2, w//2:-w//2, :]  # [B, X, Y, D]
     else:
         pass # x_local already [B, X, Y, D]
 
@@ -115,9 +119,12 @@ def get_global_lateral(x: tf.Tensor, global_sparsity: float) -> tf.Tensor:
     if clipped_global_sparsity != global_sparsity:
         warnings.warn(f'global sparsity level {global_sparsity} was clipped to {clipped_global_sparsity} .')
 
-    N_g = 1. / (1. - global_sparsity)
+    N_g = int(1. / global_sparsity)
     B, X, Y, D = x.shape.as_list()
-    x_global = tf.reshape(x, (B, X*Y/N_g, N_g, D))   # [B, X*Y/N_g, N_g, D]
+    # find closest common divisor to N_g that divides x
+    while X*Y % N_g != 0:
+        N_g -= 1
+    x_global = tf.reshape(x, (B, -1, N_g, D))   # [B, X*Y/N_g, N_g, D]
     x_global = tf.tile(x_global, tf.constant([1, N_g, 1, 1]))  # [B, X*Y, N_g, D]
     x_global = tf.reshape(x_global, (B, X, Y, N_g, D))  # [B, X, Y, N_g, D]
 
